@@ -1,0 +1,829 @@
+"""
+scrapers/betano.py
+==================
+Scraper da Betano Brasil — mercados:
+  - match_odds     (1X2)
+  - over_under     (Total de Gols Mais/Menos)
+  - btts           (Ambas equipes Marcam)
+  - halftime       (Resultado do 1o Tempo)
+
+Uso:
+  python betano.py                         # testa Brasileirao
+  python betano.py --liga premier_league   # testa outra liga
+  python betano.py --todas                 # todas as ligas
+"""
+
+import re
+import time
+import logging
+import argparse
+import json
+from collections import defaultdict
+from datetime import datetime
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from seleniumbase import Driver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.wait import WebDriverWait
+from a_selenium2df import get_df
+
+# ── Logging ───────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [Betano] %(levelname)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("betano")
+
+BOOKMAKER = "betano"
+
+# ── Ligas configuradas ────────────────────────────────────────────────────
+LIGAS = [
+    {
+        "id":    "brasileirao",
+        "nome":  "Brasileirao Serie A",
+        "url":   "https://www.betano.bet.br/sport/futebol/brasil/brasileirao-serie-a/10016/",
+        "sport": "football",
+        "pais":  "brasil",
+    },
+    {
+        "id":    "libertadores",
+        "nome":  "Copa Libertadores",
+        "url":   "https://www.betano.bet.br/sport/futebol/competicoes/copa-libertadores/189817/",
+        "sport": "football",
+        "pais":  "south_america",
+    },
+    {
+        "id":    "premier_league",
+        "nome":  "Premier League",
+        "url":   "https://www.betano.bet.br/sport/futebol/inglaterra/premier-league/1/",
+        "sport": "football",
+        "pais":  "england",
+    },
+    {
+        "id":    "la_liga",
+        "nome":  "La Liga",
+        "url":   "https://www.betano.bet.br/sport/futebol/espanha/laliga/5/",
+        "sport": "football",
+        "pais":  "spain",
+    },
+    {
+        "id":    "serie_a",
+        "nome":  "Serie A Italia",
+        "url":   "https://www.betano.bet.br/sport/futebol/italia/serie-a/1635/",
+        "sport": "football",
+        "pais":  "italy",
+    },
+    {
+        "id":    "bundesliga",
+        "nome":  "Bundesliga",
+        "url":   "https://www.betano.bet.br/sport/futebol/alemanha/bundesliga/216/",
+        "sport": "football",
+        "pais":  "germany",
+    },
+    {
+        "id":    "ligue_1",
+        "nome":  "Ligue 1",
+        "url":   "https://www.betano.bet.br/sport/futebol/franca/ligue-1/25/",
+        "sport": "football",
+        "pais":  "france",
+    },
+    {
+        "id":    "arabia_saudita",
+        "nome":  "Liga Arabia Saudita",
+        "url":   "https://www.betano.bet.br/sport/futebol/competicoes/arabia-saudita/11462/",
+        "sport": "football",
+        "pais":  "saudi_arabia",
+    },
+    {
+        "id":    "argentina",
+        "nome":  "Liga Argentina",
+        "url":   "https://www.betano.bet.br/sport/futebol/competicoes/argentina/11319/",
+        "sport": "football",
+        "pais":  "argentina",
+    },
+    {
+        "id":    "portugal",
+        "nome":  "Liga Portugal",
+        "url":   "https://www.betano.bet.br/sport/futebol/competicoes/portugal/11382/",
+        "sport": "football",
+        "pais":  "portugal",
+    },
+]
+
+# ── Driver ────────────────────────────────────────────────────────────────
+
+def init_driver(headless: bool = True) -> Driver:
+    log.info(f"Iniciando Chrome (headless={headless})...")
+    return Driver(
+        uc=True,
+        headless=headless,
+        agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+
+# ── Popup handling ────────────────────────────────────────────────────────
+
+def fechar_popups(driver: Driver) -> None:
+    """Fecha popup de idade, cookies e remove overlays via JS."""
+    try:
+        driver.find_element(By.XPATH,
+            "//button[normalize-space()='SIM' or normalize-space()='Sim']"
+        ).click()
+        time.sleep(1)
+        log.info("Popup de idade fechado.")
+    except Exception:
+        pass
+
+    try:
+        driver.find_element(By.XPATH,
+            "//button[contains(text(),'ACEITO') or contains(text(),'Aceito')]"
+        ).click()
+        time.sleep(1)
+        log.info("Cookies aceitos.")
+    except Exception:
+        pass
+
+    # Remover qualquer overlay restante via JS
+    driver.execute_script("""
+        ['[class*="modal"]','[class*="overlay"]','[class*="dialog"]',
+         '[class*="popup"]','[role="dialog"]','[aria-modal="true"]'
+        ].forEach(s => document.querySelectorAll(s).forEach(e => e.remove()));
+        document.body.style.overflow = 'auto';
+        document.documentElement.style.overflow = 'auto';
+    """)
+
+# ── Carregamento de pagina ────────────────────────────────────────────────
+
+def load_page(driver: Driver, url: str, retries: int = 3) -> bool:
+    for attempt in range(1, retries + 1):
+        try:
+            log.info(f"Carregando (tentativa {attempt}): {url}")
+            driver.get(url)
+            time.sleep(6)
+            fechar_popups(driver)
+            time.sleep(2)
+            log.info("Pagina carregada.")
+            return True
+        except Exception as e:
+            log.warning(f"Falha ao carregar: {e}")
+            if attempt < retries:
+                time.sleep(3)
+    return False
+
+# ── Extracao de sections ──────────────────────────────────────────────────
+
+def get_sections(driver: Driver) -> pd.DataFrame:
+    for attempt in range(1, 4):
+        try:
+            log.info(f"Extraindo dados (tentativa {attempt})...")
+            df = get_df(driver, By, WebDriverWait, EC,
+                        queryselector="section", with_methods=True)
+            if not df.empty:
+                log.info(f"Extraidas {len(df)} sections.")
+                return df
+        except Exception as e:
+            log.warning(f"Erro na extracao: {e}")
+            time.sleep(2)
+    return pd.DataFrame()
+
+def get_maior_section(driver: Driver) -> str:
+    """Retorna o texto da section com mais conteudo."""
+    df = get_sections(driver)
+    if df.empty:
+        return ""
+    df["_len"] = df.aa_innerText.str.len().fillna(0)
+    return str(df.sort_values("_len", ascending=False).iloc[0].aa_innerText)
+
+# ── Scroll e abas ─────────────────────────────────────────────────────────
+
+def scroll_para_carregar(driver: Driver) -> None:
+    """Scroll gradual para garantir lazy loading das abas."""
+    for y in [300, 600, 900, 0]:
+        driver.execute_script(f"window.scrollTo(0, {y});")
+        time.sleep(0.4)
+    time.sleep(1)
+
+def clicar_aba(driver: Driver, nome: str) -> bool:
+    """Clica em uma aba pelo texto exato usando JS."""
+    resultado = driver.execute_script(f"""
+        const all = document.querySelectorAll('*');
+        for (let el of all) {{
+            if (el.children.length === 0 && el.innerText &&
+                el.innerText.trim() === '{nome}') {{
+                el.click();
+                return true;
+            }}
+        }}
+        return false;
+    """)
+    return bool(resultado)
+
+# ── Helpers de parsing ────────────────────────────────────────────────────
+
+def to_float(s: str) -> Optional[float]:
+    try:
+        return float(str(s).replace(",", ".").strip())
+    except Exception:
+        return None
+
+def is_odd(s: str) -> bool:
+    v = to_float(s)
+    return v is not None and 1.0 < v < 100.0
+
+def normalize_date(s: str) -> str:
+    try:
+        d, m = s.strip().split("/")
+        return f"{datetime.now().year}-{int(m):02d}-{int(d):02d}"
+    except Exception:
+        return ""
+
+def linhas_de(texto: str) -> list:
+    return [l.strip() for l in texto.splitlines() if l.strip()]
+
+# ── PARSER: match_odds (1X2) ──────────────────────────────────────────────
+
+def _dividir_em_blocos(df: pd.DataFrame) -> list:
+    df = df.reset_index(drop=True)
+    df[0] = df[0].str.strip()
+    df = df[df[0] != ""].reset_index(drop=True)
+    date_positions = df.loc[
+        df[0].str.contains(r"^\d{1,2}/\d{2}$", regex=True)
+    ].index.tolist()
+    if not date_positions:
+        return []
+    blocos = []
+    for i, start in enumerate(date_positions):
+        end = date_positions[i + 1] if i + 1 < len(date_positions) else len(df)
+        bloco = df.iloc[start:end].reset_index(drop=True)
+        if len(bloco) >= 9:
+            blocos.append(bloco)
+    return blocos
+
+
+def parse_match_odds(texto: str, liga: dict) -> list:
+    """
+    Extrai odds 1X2 da pagina principal da liga.
+
+    Estrutura por jogo:
+      DD/MM / HH:MM / TimeCasa / TimeVisitante
+      1 / odd1 / X / oddX / 2 / odd2
+    """
+    linhas = pd.DataFrame(
+        [l.strip() for l in texto.splitlines() if l.strip()],
+        columns=[0]
+    )
+    blocos = _dividir_em_blocos(linhas)
+    if not blocos:
+        log.warning(f"Nenhuma data encontrada em {liga['nome']}")
+        return []
+
+    results = []
+    for b in blocos:
+        ls = b[0].tolist()
+        if len(ls) < 10:
+            continue
+        try:
+            odd1 = to_float(ls[5])
+            oddX = to_float(ls[7])
+            odd2 = to_float(ls[9])
+            if not all([odd1, oddX, odd2]):
+                continue
+            if odd1 <= 1 or oddX <= 1 or odd2 <= 1:
+                continue
+            results.append({
+                "bookmaker": BOOKMAKER,
+                "sport":     liga["sport"],
+                "pais":      liga["pais"],
+                "liga_id":   liga["id"],
+                "liga":      liga["nome"],
+                "evento":    f"{ls[2]} vs {ls[3]}",
+                "home":      ls[2],
+                "away":      ls[3],
+                "date":      normalize_date(ls[0]),
+                "time":      ls[1],
+                "market":    "match_odds",
+                "odds": {
+                    "home": round(odd1, 2),
+                    "draw": round(oddX, 2),
+                    "away": round(odd2, 2),
+                },
+            })
+        except Exception:
+            continue
+
+    log.info(f"{liga['nome']} match_odds: {len(results)} evento(s)")
+    return results
+
+# ── PARSER: over_under ────────────────────────────────────────────────────
+
+def parse_over_under(texto: str, home: str, away: str, date: str, hora: str, liga: dict) -> list:
+    """
+    Extrai odds Over/Under de GOLS TOTAIS FT da pagina do jogo.
+
+    Pega dois blocos:
+      1. "Total de Gols Mais/Menos"            -> linha padrao (2.5)
+      2. "Total de Gols Mais/Menos (alternativas)" -> linhas 0.5, 1.5, 3.5...
+
+    Para quando encontra mercados de times individuais ou HT.
+    """
+    linhas = linhas_de(texto)
+    results = []
+
+    INICIO = re.compile(r"^total de gols mais/menos(\s*\(alternativas\))?$", re.I)
+    FIM    = re.compile(
+        r"^escanteios|^total de cart|^resultado|^ambas|^handicap|"
+        r"^intervalo|^dupla|^chance|total de gols mais/menos.*1.*tempo|"
+        r".+\s+-\s+total de gols",
+        re.I
+    )
+
+    i = 0
+    while i < len(linhas):
+        if INICIO.match(linhas[i]):
+            i += 1
+            while i < len(linhas):
+                if FIM.match(linhas[i]):
+                    break
+                if INICIO.match(linhas[i]):
+                    # Novo sub-bloco (alternativas) — continuar
+                    i += 1
+                    continue
+                if re.match(r"^mais de$", linhas[i], re.I):
+                    try:
+                        handicap  = linhas[i+1].strip()
+                        odd_over  = to_float(linhas[i+2])
+                        menos     = linhas[i+3]
+                        odd_under = to_float(linhas[i+5])
+
+                        if (re.match(r"^menos de$", menos, re.I) and
+                                odd_over and odd_under and
+                                odd_over > 1 and odd_under > 1):
+                            results.append({
+                                "bookmaker": BOOKMAKER,
+                                "sport":     liga["sport"],
+                                "pais":      liga["pais"],
+                                "liga_id":   liga["id"],
+                                "liga":      liga["nome"],
+                                "evento":    f"{home} vs {away}",
+                                "home":      home,
+                                "away":      away,
+                                "date":      date,
+                                "time":      hora,
+                                "market":    "over_under_ft",
+                                "odds": {
+                                    "line":  handicap,
+                                    "over":  round(odd_over, 2),
+                                    "under": round(odd_under, 2),
+                                },
+                            })
+                            i += 6
+                            continue
+                    except (IndexError, TypeError):
+                        pass
+                i += 1
+            break
+        i += 1
+
+    return results
+
+# ── PARSER: double_chance ─────────────────────────────────────────────────
+
+def parse_double_chance(texto: str, home: str, away: str, date: str, hora: str, liga: dict) -> list:
+    """
+    Extrai odds de Chance Dupla (aba Principais).
+
+    Estrutura:
+      Chance Dupla
+      Santos ou Empate    <- home_or_draw (1X)
+      1.17
+      Santos ou Remo      <- home_or_away (12)
+      1.27
+      Remo ou Empate      <- draw_or_away (X2)
+      2.25
+    """
+    linhas = linhas_de(texto)
+
+    for i, linha in enumerate(linhas):
+        if re.match(r"^chance dupla$", linha, re.I):
+            bloco = linhas[i+1:i+10]
+            odds_vals = []
+            for l in bloco:
+                v = to_float(l)
+                if v and v > 1.0:
+                    odds_vals.append(round(v, 2))
+                if len(odds_vals) == 3:
+                    break
+
+            if len(odds_vals) == 3:
+                return [{
+                    "bookmaker": BOOKMAKER,
+                    "sport":     liga["sport"],
+                    "pais":      liga["pais"],
+                    "liga_id":   liga["id"],
+                    "liga":      liga["nome"],
+                    "evento":    f"{home} vs {away}",
+                    "home":      home,
+                    "away":      away,
+                    "date":      date,
+                    "time":      hora,
+                    "market":    "double_chance",
+                    "odds": {
+                        "home_or_draw": odds_vals[0],
+                        "home_or_away": odds_vals[1],
+                        "draw_or_away": odds_vals[2],
+                    },
+                }]
+    return []
+
+# ── PARSER: btts ─────────────────────────────────────────────────────────
+
+def parse_btts(texto: str, home: str, away: str, date: str, hora: str, liga: dict) -> list:
+    """
+    Extrai odds BTTS (Ambas equipes Marcam).
+
+    Estrutura (apos expandir o mercado):
+      Ambas equipes Marcam
+      Sim
+      1.88
+      Nao
+      1.87
+
+    Ou em linha unica:
+      Sim    1.88    Nao    1.87
+    """
+    linhas = linhas_de(texto)
+
+    for i, linha in enumerate(linhas):
+        if re.match(r"^ambas equipes marcam$", linha, re.I):
+            bloco = linhas[i+1:i+10]
+            odd_yes = None
+            odd_no  = None
+
+            for j, l in enumerate(bloco):
+                if re.match(r"^sim$", l.strip(), re.I):
+                    # Odd vem na proxima linha nao-vazia
+                    for k in range(j+1, min(j+3, len(bloco))):
+                        v = to_float(bloco[k])
+                        if v and v > 1:
+                            odd_yes = round(v, 2)
+                            break
+                elif re.match(r"^n[aã]o$", l.strip(), re.I):
+                    for k in range(j+1, min(j+3, len(bloco))):
+                        v = to_float(bloco[k])
+                        if v and v > 1:
+                            odd_no = round(v, 2)
+                            break
+
+            if odd_yes and odd_no:
+                return [{
+                    "bookmaker": BOOKMAKER,
+                    "sport":     liga["sport"],
+                    "pais":      liga["pais"],
+                    "liga_id":   liga["id"],
+                    "liga":      liga["nome"],
+                    "evento":    f"{home} vs {away}",
+                    "home":      home,
+                    "away":      away,
+                    "date":      date,
+                    "time":      hora,
+                    "market":    "btts",
+                    "odds": {
+                        "yes": odd_yes,
+                        "no":  odd_no,
+                    },
+                }]
+    return []
+
+# ── PARSER: over_under_ht ────────────────────────────────────────────────
+
+def parse_over_under_ht(texto: str, home: str, away: str, date: str, hora: str, liga: dict) -> list:
+    """
+    Extrai odds Over/Under do 1o Tempo (Half Time).
+
+    Estrutura:
+      Total de gols Mais/Menos - 1° Tempo
+      Mais de / 0.5 / odd / Menos de / 0.5 / odd
+      Mais de / 1.5 / odd / Menos de / 1.5 / odd
+    """
+    linhas = linhas_de(texto)
+    results = []
+
+    INICIO = re.compile(r"total de gols mais/menos.*1.*tempo", re.I)
+    FIM    = re.compile(r"^intervalo|^ambas|^handicap|^resultado|^escanteio|^dupla", re.I)
+
+    i = 0
+    while i < len(linhas):
+        if INICIO.search(linhas[i]):
+            i += 1
+            while i < len(linhas) and not FIM.match(linhas[i]):
+                if re.match(r"^mais de$", linhas[i], re.I):
+                    try:
+                        handicap  = linhas[i+1].strip()
+                        odd_over  = to_float(linhas[i+2])
+                        menos     = linhas[i+3]
+                        odd_under = to_float(linhas[i+5])
+
+                        if (re.match(r"^menos de$", menos, re.I) and
+                                odd_over and odd_under and
+                                odd_over > 1 and odd_under > 1):
+                            results.append({
+                                "bookmaker": BOOKMAKER,
+                                "sport":     liga["sport"],
+                                "pais":      liga["pais"],
+                                "liga_id":   liga["id"],
+                                "liga":      liga["nome"],
+                                "evento":    f"{home} vs {away}",
+                                "home":      home,
+                                "away":      away,
+                                "date":      date,
+                                "time":      hora,
+                                "market":    "over_under_ht",
+                                "odds": {
+                                    "line":  handicap,
+                                    "over":  round(odd_over, 2),
+                                    "under": round(odd_under, 2),
+                                },
+                            })
+                            i += 6
+                            continue
+                    except (IndexError, TypeError):
+                        pass
+                i += 1
+            break
+        i += 1
+
+    return results
+
+# ── PARSER: halftime ──────────────────────────────────────────────────────
+
+def parse_halftime(texto: str, home: str, away: str, date: str, hora: str, liga: dict) -> list:
+    """
+    Extrai odds Resultado do 1o Tempo da pagina do jogo (aba Intervalo).
+
+    Estrutura:
+      Resultado do 1° Tempo
+      Santos / 2.25 / Empate / 2.12 / Remo / 5.60
+    """
+    linhas = linhas_de(texto)
+    results = []
+
+    for i, linha in enumerate(linhas):
+        if re.match(r"resultado do 1", linha, re.I):
+            try:
+                home_ht  = linhas[i+1]
+                odd_home = to_float(linhas[i+2])
+                draw_lbl = linhas[i+3]
+                odd_draw = to_float(linhas[i+4])
+                away_ht  = linhas[i+5]
+                odd_away = to_float(linhas[i+6])
+
+                if (re.match(r"^empate$", draw_lbl, re.I) and
+                        odd_home and odd_draw and odd_away and
+                        odd_home > 1 and odd_draw > 1 and odd_away > 1):
+                    results.append({
+                        "bookmaker": BOOKMAKER,
+                        "sport":     liga["sport"],
+                        "pais":      liga["pais"],
+                        "liga_id":   liga["id"],
+                        "liga":      liga["nome"],
+                        "evento":    f"{home} vs {away}",
+                        "home":      home,
+                        "away":      away,
+                        "date":      date,
+                        "time":      hora,
+                        "market":    "halftime_result",
+                        "odds": {
+                            "home": round(odd_home, 2),
+                            "draw": round(odd_draw, 2),
+                            "away": round(odd_away, 2),
+                        },
+                    })
+                    break
+            except (IndexError, TypeError):
+                continue
+
+    return results
+
+# ── Scraping de mercados adicionais (pagina do jogo) ──────────────────────
+
+def scrape_mercados_jogo(driver: Driver, match: dict, liga: dict) -> list:
+    """
+    Acessa a pagina individual do jogo e extrai mercados adicionais:
+      - over_under (aba Mais/Menos)
+      - btts       (aba Mais/Menos)
+      - halftime   (aba Intervalo)
+
+    A URL do jogo e construida a partir do evento:
+      betano.bet.br/odds/{home-slug}-{away-slug}/{event_id}/
+    Porem como nao temos o ID, usamos a busca por nome na pagina da liga.
+    """
+    results = []
+    home  = match["home"]
+    away  = match["away"]
+    date  = match["date"]
+    hora  = match["time"]
+
+    # ── ABA: PRINCIPAIS — Chance Dupla + BTTS ──
+    scroll_para_carregar(driver)
+    clicou_princ = clicar_aba(driver, "Principais")
+    if clicou_princ:
+        time.sleep(3)
+
+        # Chance Dupla — ja aparece expandida na aba Principais
+        texto_princ = get_maior_section(driver)
+        dc = parse_double_chance(texto_princ, home, away, date, hora, liga)
+        results += dc
+
+        # BTTS — accordion colapsado, clicar via data-qa="market-type-id-15"
+        # UMA UNICA vez (segundo clique fecha o accordion)
+        driver.execute_script("""
+            const el = document.querySelector('[data-qa="market-type-id-15"]');
+            if (el) {
+                el.scrollIntoView({block: 'center'});
+                el.click();
+            }
+        """)
+        time.sleep(2)
+
+        texto_btts = get_maior_section(driver)
+        bt = parse_btts(texto_btts, home, away, date, hora, liga)
+        results += bt
+
+        log.info(f"  double_chance: {len(dc)} | btts: {len(bt)}")
+    else:
+        log.warning("  Aba Principais nao encontrada")
+
+    # ── ABA: MAIS/MENOS — Over/Under FT ──
+    clicou = clicar_aba(driver, "Mais/Menos")
+    if clicou:
+        time.sleep(3)
+        texto_mm = get_maior_section(driver)
+        ou = parse_over_under(texto_mm, home, away, date, hora, liga)
+        results += ou
+        log.info(f"  over_under_ft: {len(ou)}")
+    else:
+        log.warning("  Aba Mais/Menos nao encontrada")
+
+    # ── ABA: INTERVALO ──
+    clicou = clicar_aba(driver, "Intervalo")
+    if clicou:
+        time.sleep(3)
+        texto_int = get_maior_section(driver)
+        ht = parse_halftime(texto_int, home, away, date, hora, liga)
+        results += ht
+        log.info(f"  halftime_result: {len(ht)}")
+    else:
+        log.warning("  Aba Intervalo nao encontrada")
+
+    return results
+
+
+# ── Scraping principal ────────────────────────────────────────────────────
+
+def scrape_liga(driver: Driver, liga: dict, mercados_extras: bool = True) -> list:
+    """
+    Scrape completo de uma liga:
+      1. Carrega pagina da liga e extrai 1X2
+      2. Para cada jogo, acessa pagina individual e extrai outros mercados
+    """
+    log.info(f"Scraping: {liga['nome']}")
+
+    if not load_page(driver, liga["url"]):
+        return []
+
+    texto = get_maior_section(driver)
+    if not texto:
+        log.error(f"Sem conteudo em {liga['nome']}")
+        return []
+
+    # Extrai 1X2
+    matches = parse_match_odds(texto, liga)
+    all_results = list(matches)
+
+    if not mercados_extras or not matches:
+        return all_results
+
+    # Para cada jogo encontrado, buscar URL e extrair mercados extras
+    # A Betano tem URLs no formato /odds/{slug}/{id}/
+    # Vamos extrair os links dos jogos da pagina atual
+    log.info(f"Buscando URLs dos jogos para mercados extras...")
+    links_jogos = driver.execute_script("""
+        const links = [];
+        document.querySelectorAll('a[href*="/odds/"]').forEach(a => {
+            if (a.href && !links.includes(a.href)) {
+                links.push(a.href);
+            }
+        });
+        return links;
+    """)
+
+    log.info(f"URLs encontradas: {len(links_jogos)}")
+
+    for i, match in enumerate(matches):
+        # Tentar encontrar link correspondente ao jogo
+        home_slug = match["home"].lower().replace(" ", "-")
+        away_slug = match["away"].lower().replace(" ", "-")
+
+        url_jogo = None
+        for link in links_jogos:
+            link_lower = link.lower()
+            if home_slug[:4] in link_lower or away_slug[:4] in link_lower:
+                url_jogo = link
+                break
+
+        if not url_jogo:
+            log.warning(f"URL nao encontrada para {match['evento']}")
+            continue
+
+        log.info(f"[{i+1}/{len(matches)}] {match['evento']} → {url_jogo}")
+
+        if not load_page(driver, url_jogo):
+            continue
+
+        extras = scrape_mercados_jogo(driver, match, liga)
+        all_results += extras
+
+        # Voltar para a pagina da liga
+        if i < len(matches) - 1:
+            time.sleep(1)
+
+    return all_results
+
+
+def scrape_all(
+    liga_ids: list = None,
+    headless: bool = True,
+    mercados_extras: bool = True,
+) -> list:
+    """Scrape de todas as ligas configuradas."""
+    ligas = LIGAS if not liga_ids else [l for l in LIGAS if l["id"] in liga_ids]
+
+    all_events = []
+    driver = None
+
+    try:
+        driver = init_driver(headless=headless)
+        for liga in ligas:
+            events = scrape_liga(driver, liga, mercados_extras=mercados_extras)
+            all_events.extend(events)
+            time.sleep(2)
+    except Exception as e:
+        log.error(f"Falha geral: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+                log.info("Chrome encerrado.")
+            except Exception:
+                pass
+
+    log.info(f"Total coletado: {len(all_events)} registros de {len(ligas)} liga(s).")
+    return all_events
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Betano Scraper")
+    parser.add_argument("--liga", default="brasileirao", help="ID da liga")
+    parser.add_argument("--todas", action="store_true", help="Todas as ligas")
+    parser.add_argument("--sem-extras", action="store_true", help="Apenas 1X2")
+    parser.add_argument("--visivel", action="store_true", help="Chrome visivel")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("BETANO SCRAPER")
+    print("=" * 60)
+
+    liga_ids = None if args.todas else [args.liga]
+    events = scrape_all(
+        liga_ids=liga_ids,
+        headless=not args.visivel,
+        mercados_extras=not args.sem_extras,
+    )
+
+    # Agrupar por mercado para exibicao
+    por_mercado = defaultdict(list)
+    for e in events:
+        por_mercado[e["market"]].append(e)
+
+    print(f"\nTotal: {len(events)} registros\n")
+    for market, evs in por_mercado.items():
+        print(f"\n── {market.upper()} ({len(evs)}) ──")
+        for ev in evs[:3]:  # mostrar ate 3 por mercado
+            odds_str = " | ".join(f"{k}:{v}" for k, v in ev["odds"].items())
+            print(f"  {ev['evento']:<35} {odds_str}")
+        if len(evs) > 3:
+            print(f"  ... e mais {len(evs)-3}")
+
+    # Salvar JSON
+    with open("betano_output.json", "w", encoding="utf-8") as f:
+        json.dump(events, f, ensure_ascii=False, indent=2)
+    print(f"\nSalvo em betano_output.json")
